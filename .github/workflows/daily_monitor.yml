@@ -1,0 +1,40 @@
+name: Pension Fund Allocation Monitor
+
+on:
+  # Runs daily at 5:00 PM Pacific Time
+  # PST = UTC-8 → 1:00 AM UTC | PDT = UTC-7 → 12:00 AM UTC
+  # Using 12:00 AM UTC to cover PDT; adjust to "0 1 * * *" during PST if needed
+  schedule:
+    - cron: "0 0 * * *"
+
+  # Allows you to manually trigger from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pension monitor
+        env:
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+        run: python pension_monitor.py
