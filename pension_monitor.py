@@ -63,7 +63,7 @@ PENSION_FUNDS = [
     "Virginia Retirement System", "Oregon Investment Council",
     "Michigan Retirement Systems", "Pennsylvania Public School Employees",
     "State Teachers Retirement System of Ohio", "Minnesota State Board of Investment",
-    "Colorado PERA", "Massachusetts PRIM",
+    "Colorado PERA", "Massachusetts PRIM", "MassPRIM",
     "Los Angeles County Employees Retirement", "LACERA",
     "Teacher Retirement System of Texas", "Maryland State Retirement",
     "Connecticut Retirement Plans", "Tennessee Consolidated Retirement System",
@@ -286,6 +286,7 @@ def score_article(article):
     score = 0
 
     # Check for pension fund mentions
+    title = article.get("title", "").lower()
     pension_match = False
     matched_pension = None
     for fund in PENSION_FUNDS:
@@ -293,6 +294,9 @@ def score_article(article):
             pension_match = True
             matched_pension = fund
             score += 30
+            # Extra boost if the pension fund name is in the title (strongest signal)
+            if fund.lower() in title:
+                score += 20
             break
 
     if not pension_match:
