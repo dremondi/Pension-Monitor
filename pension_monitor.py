@@ -6,7 +6,7 @@ Scrapes the web daily for news about the top 100 US public pensions
 making new allocations to VC, PE, and private credit funds.
 Sends a formatted digest email at 5pm PT.
 
-Author: Dan Remondi / General Catalyst CVF Team
+Uses SerpAPI for web search (free tier: 100 searches/month).
 """
 
 import os
@@ -15,30 +15,28 @@ import time
 import logging
 import smtplib
 import hashlib
+import re
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────
 
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "dremondi@generalcatalyst.com")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")          # e.g. monitor@yourdomain.com
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")         # App password (not regular pw)
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
-# Google Custom Search API (free tier: 100 queries/day)
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+# SerpAPI key (free tier: 100 searches/month)
+# Get yours at: https://serpapi.com/
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 
 # Optional: NewsAPI.org key for supplementary search (free tier: 100 req/day)
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
@@ -56,19 +54,16 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────
 
 PENSION_FUNDS = [
-    # Mega plans (>$100B)
     "CalPERS", "CalSTRS", "New York State Common Retirement Fund",
     "New York City Retirement Systems", "Florida State Board of Administration",
     "Texas Teachers Retirement System", "New York State Teachers Retirement System",
     "State of Wisconsin Investment Board", "Washington State Investment Board",
     "Ohio Public Employees Retirement System",
-    # Large plans ($50B-$100B)
     "North Carolina Retirement Systems", "New Jersey Division of Investment",
     "Virginia Retirement System", "Oregon Investment Council",
     "Michigan Retirement Systems", "Pennsylvania Public School Employees",
     "State Teachers Retirement System of Ohio", "Minnesota State Board of Investment",
     "Colorado PERA", "Massachusetts PRIM",
-    # Mid-Large ($25B-$50B)
     "Los Angeles County Employees Retirement", "LACERA",
     "Teacher Retirement System of Texas", "Maryland State Retirement",
     "Connecticut Retirement Plans", "Tennessee Consolidated Retirement System",
@@ -84,7 +79,6 @@ PENSION_FUNDS = [
     "Kansas Public Employees Retirement System", "Louisiana State Employees Retirement",
     "Utah Retirement Systems", "Rhode Island State Investment Commission",
     "Alabama Retirement Systems", "Mississippi Public Employees Retirement System",
-    # Mid-size ($10B-$25B)
     "San Diego County Employees Retirement", "SDCERA",
     "Orange County Employees Retirement System", "OCERS",
     "Contra Costa County Employees Retirement", "CCCERA",
@@ -102,7 +96,6 @@ PENSION_FUNDS = [
     "North Dakota State Investment Board", "South Dakota Investment Council",
     "Alaska Permanent Fund", "Delaware Public Employees Retirement System",
     "District of Columbia Retirement Board",
-    # Notable city/county plans
     "Chicago Teachers Pension Fund", "Chicago Municipal Employees",
     "Chicago Police Pension Fund", "Chicago Fire Pension Fund",
     "New York City Teachers Retirement System",
@@ -125,7 +118,6 @@ PENSION_FUNDS = [
 # Search Queries & Keyword Filters
 # ─────────────────────────────────────────────────────────────────────
 
-# Asset class terms to search for
 ASSET_CLASSES = [
     "private credit", "private equity", "venture capital",
     "private debt", "direct lending", "mezzanine",
@@ -133,7 +125,6 @@ ASSET_CLASSES = [
     "alternative credit", "infrastructure debt",
 ]
 
-# Action-oriented keywords (signals active allocation decisions)
 ACTION_KEYWORDS = [
     "allocate", "allocated", "allocation", "commit", "committed", "commitment",
     "increase", "increased", "raise", "raised", "approve", "approved",
@@ -145,7 +136,6 @@ ACTION_KEYWORDS = [
     "emerging manager", "first-time fund",
 ]
 
-# Negative keywords to exclude noise
 EXCLUDE_KEYWORDS = [
     "lawsuit", "scandal", "bankruptcy", "fraud",
     "pension crisis", "underfunded", "layoff",
@@ -156,68 +146,78 @@ EXCLUDE_KEYWORDS = [
 # ─────────────────────────────────────────────────────────────────────
 
 def build_search_queries():
-    """Generate focused search queries combining pension names + asset classes."""
-    queries = []
+    """
+    Generate focused search queries.
+    SerpAPI free tier = 100/month, so we use ~15-20 queries per run
+    to stay well within budget for daily use.
+    """
+    queries = [
+        # Broad pension + asset class queries (8 queries)
+        'public pension "private credit" allocate OR commit OR approve 2025 OR 2026',
+        'public pension "private equity" new commitment OR allocation 2025 OR 2026',
+        'public pension "venture capital" allocation OR investment 2025 OR 2026',
+        'pension fund "direct lending" OR "private debt" commitment allocation',
+        'pension board approved "private equity" OR "private credit" commitment',
+        'state retirement fund "private equity" OR "private credit" new allocation',
+        'pension fund "emerging manager" OR "co-investment" private credit equity',
+        'public pension alternative investment allocation increase 2026',
 
-    # Strategy 1: Broad asset-class searches with pension context
-    broad_queries = [
-        'public pension "private credit" allocate commit 2025 2026',
-        'public pension "private equity" new fund commitment 2026',
-        'public pension "venture capital" allocation increase 2026',
-        'state pension "private credit" fund investment approved',
-        'pension fund "direct lending" commitment allocation',
-        'public retirement system "private equity" commit approved',
-        'pension fund "alternative credit" new allocation',
-        'state retirement "private debt" investment approve',
-        'pension board approved "private equity" commitment',
-        'pension board approved "private credit" allocation',
-        'pension fund "emerging manager" private credit equity',
-        'public pension "co-investment" private equity credit',
+        # Top pension names specifically (8 queries)
+        'CalPERS "private credit" OR "private equity" OR "venture capital" allocation OR commit',
+        'CalSTRS "private credit" OR "private equity" OR "venture capital" allocation OR commit',
+        '"New York State Common" OR "NYSCRF" private credit OR private equity allocation',
+        '"State of Wisconsin Investment Board" OR "SWIB" private equity OR credit',
+        '"Washington State Investment Board" OR "WSIB" private equity OR credit commit',
+        '"New Jersey Division of Investment" private credit OR equity allocation',
+        '"Virginia Retirement System" OR "Oregon Investment Council" private equity credit',
+        '"Texas Teachers" OR "Ohio PERS" private credit OR equity allocation commit',
     ]
-    queries.extend(broad_queries)
-
-    # Strategy 2: Top pension names specifically (top ~30 by AUM)
-    top_pensions = PENSION_FUNDS[:30]
-    for pension in top_pensions:
-        # Use shorter name variants for better search results
-        short_name = pension.replace("Retirement System", "").replace("Retirement", "").strip()
-        queries.append(f'"{short_name}" private credit OR private equity OR venture capital allocation OR commit')
-
     return queries
 
 
-def search_google_cse(query, num_results=10):
-    """Search using Google Custom Search Engine API."""
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
-        logger.warning("Google CSE credentials not configured, skipping.")
+def search_serpapi(query, num_results=10):
+    """Search using SerpAPI (Google Search wrapper)."""
+    if not SERPAPI_KEY:
+        logger.error("SERPAPI_KEY not configured.")
         return []
 
-    url = "https://www.googleapis.com/customsearch/v1"
+    url = "https://serpapi.com/search"
     params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
+        "api_key": SERPAPI_KEY,
+        "engine": "google",
         "q": query,
-        "num": min(num_results, 10),
-        "dateRestrict": "d3",   # last 3 days
-        "sort": "date",
+        "num": num_results,
+        "tbs": "qdr:w",  # last week
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
+
         results = []
-        for item in data.get("items", []):
+        for item in data.get("organic_results", []):
             results.append({
                 "title": item.get("title", ""),
                 "url": item.get("link", ""),
                 "snippet": item.get("snippet", ""),
-                "source": item.get("displayLink", ""),
-                "date": item.get("pagemap", {}).get("metatags", [{}])[0].get("article:published_time", ""),
+                "source": item.get("displayed_link", item.get("source", "")),
+                "date": item.get("date", ""),
             })
+
+        # Also grab news results if present
+        for item in data.get("news_results", []):
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+                "source": item.get("source", {}).get("name", "") if isinstance(item.get("source"), dict) else item.get("source", ""),
+                "date": item.get("date", ""),
+            })
+
         return results
     except Exception as e:
-        logger.error(f"Google CSE error for query '{query[:50]}...': {e}")
+        logger.error(f"SerpAPI error for query '{query[:60]}...': {e}")
         return []
 
 
@@ -252,7 +252,7 @@ def search_newsapi(query, days_back=3):
             })
         return results
     except Exception as e:
-        logger.error(f"NewsAPI error for query '{query[:50]}...': {e}")
+        logger.error(f"NewsAPI error for query '{query[:60]}...': {e}")
         return []
 
 
@@ -261,17 +261,14 @@ def search_newsapi(query, days_back=3):
 # ─────────────────────────────────────────────────────────────────────
 
 def article_hash(article):
-    """Create a unique hash for deduplication."""
     key = (article.get("url", "") or article.get("title", "")).lower().strip()
     return hashlib.md5(key.encode()).hexdigest()
 
 
 def load_seen_cache():
-    """Load previously seen article hashes."""
     if CACHE_FILE.exists():
         try:
             data = json.loads(CACHE_FILE.read_text())
-            # Prune old entries
             cutoff = (datetime.utcnow() - timedelta(days=MAX_CACHE_AGE_DAYS)).isoformat()
             return {k: v for k, v in data.items() if v > cutoff}
         except Exception:
@@ -280,15 +277,11 @@ def load_seen_cache():
 
 
 def save_seen_cache(cache):
-    """Save seen article hashes."""
     CACHE_FILE.write_text(json.dumps(cache, indent=2))
 
 
 def score_article(article):
-    """
-    Score an article's relevance (0-100).
-    Higher scores = more actionable for outreach.
-    """
+    """Score an article's relevance (0-100)."""
     text = f"{article.get('title', '')} {article.get('snippet', '')}".lower()
     score = 0
 
@@ -302,7 +295,6 @@ def score_article(article):
             score += 30
             break
 
-    # Generic pension references
     if not pension_match:
         pension_generics = ["pension", "retirement system", "retirement fund", "public employees"]
         if any(term in text for term in pension_generics):
@@ -324,10 +316,9 @@ def score_article(article):
         if kw in text:
             action_count += 1
             matched_actions.append(kw)
-    score += min(action_count * 5, 25)  # Cap at 25 from actions
+    score += min(action_count * 5, 25)
 
-    # Dollar amount mentions (strong signal)
-    import re
+    # Dollar amount mentions
     dollar_pattern = r'\$[\d,.]+\s*(?:million|billion|mn|bn|m|b)'
     if re.search(dollar_pattern, text, re.IGNORECASE):
         score += 10
@@ -337,7 +328,7 @@ def score_article(article):
         if neg in text:
             score -= 20
 
-    # Must have BOTH pension context AND asset class to be relevant
+    # Must have pension context AND asset class
     if not (pension_match or score >= 15) or not asset_match:
         score = max(score - 30, 0)
 
@@ -350,29 +341,23 @@ def score_article(article):
 
 
 def filter_and_rank(articles, min_score=25):
-    """Deduplicate, score, filter, and rank articles."""
     seen_cache = load_seen_cache()
     unique = {}
 
     for article in articles:
         h = article_hash(article)
-        if h in seen_cache:
-            continue
-        if h in unique:
+        if h in seen_cache or h in unique:
             continue
         scored = score_article(article)
         if scored["_score"] >= min_score:
             unique[h] = scored
 
-    # Update cache
     now = datetime.utcnow().isoformat()
     for h in unique:
         seen_cache[h] = now
     save_seen_cache(seen_cache)
 
-    # Sort by score descending
-    ranked = sorted(unique.values(), key=lambda x: x["_score"], reverse=True)
-    return ranked
+    return sorted(unique.values(), key=lambda x: x["_score"], reverse=True)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -380,9 +365,6 @@ def filter_and_rank(articles, min_score=25):
 # ─────────────────────────────────────────────────────────────────────
 
 def format_digest_html(articles, run_date):
-    """Format articles into a professional HTML digest email."""
-
-    # Categorize by priority
     high_priority = [a for a in articles if a["_score"] >= 60]
     medium_priority = [a for a in articles if 40 <= a["_score"] < 60]
     low_priority = [a for a in articles if a["_score"] < 40]
@@ -474,7 +456,6 @@ def format_digest_html(articles, run_date):
 
 
 def format_digest_text(articles, run_date):
-    """Plain-text fallback for the digest."""
     lines = [
         f"PENSION FUND ALLOCATION MONITOR — {run_date.strftime('%A, %B %d, %Y')}",
         f"{'=' * 60}",
@@ -498,10 +479,8 @@ def format_digest_text(articles, run_date):
 # ─────────────────────────────────────────────────────────────────────
 
 def send_email(subject, html_body, text_body):
-    """Send the digest email via SMTP."""
     if not all([SENDER_EMAIL, SMTP_USER, SMTP_PASSWORD]):
-        logger.error("SMTP credentials not configured. Set SENDER_EMAIL, SMTP_USER, SMTP_PASSWORD.")
-        # Save to local file as fallback
+        logger.error("SMTP credentials not configured.")
         fallback = Path(__file__).parent / f"digest_{datetime.utcnow().strftime('%Y%m%d')}.html"
         fallback.write_text(html_body)
         logger.info(f"Digest saved locally to {fallback}")
@@ -532,7 +511,6 @@ def send_email(subject, html_body, text_body):
 # ─────────────────────────────────────────────────────────────────────
 
 def run_monitor():
-    """Main monitor execution: search, filter, email."""
     run_date = datetime.utcnow()
     logger.info("=" * 60)
     logger.info(f"Pension Fund Allocation Monitor — {run_date.strftime('%Y-%m-%d %H:%M UTC')}")
@@ -540,48 +518,40 @@ def run_monitor():
 
     all_results = []
     queries = build_search_queries()
-    logger.info(f"Running {len(queries)} search queries...")
+    logger.info(f"Running {len(queries)} SerpAPI search queries...")
 
-    # Google Custom Search (primary)
     for i, query in enumerate(queries):
         logger.info(f"  [{i+1}/{len(queries)}] Searching: {query[:80]}...")
-        results = search_google_cse(query)
+        results = search_serpapi(query)
         all_results.extend(results)
-
-        # Rate limiting: ~1 req/sec to stay within quotas
-        time.sleep(1.2)
-
-        # Stop if we've used most of our daily quota (100 free queries)
-        if i >= 90:
-            logger.warning("Approaching Google CSE daily quota limit, stopping searches.")
-            break
+        logger.info(f"    → {len(results)} results")
+        time.sleep(1)  # Rate limiting
 
     # NewsAPI supplementary search
-    newsapi_queries = [
-        'pension "private credit" allocation',
-        'pension "private equity" commitment',
-        'pension "venture capital" investment',
-        'public pension fund new commitment',
-    ]
-    for query in newsapi_queries:
-        results = search_newsapi(query)
-        all_results.extend(results)
-        time.sleep(0.5)
+    if NEWSAPI_KEY:
+        logger.info("Running supplementary NewsAPI searches...")
+        newsapi_queries = [
+            'pension "private credit" allocation',
+            'pension "private equity" commitment',
+            'pension "venture capital" investment',
+            'public pension fund new commitment',
+        ]
+        for query in newsapi_queries:
+            results = search_newsapi(query)
+            all_results.extend(results)
+            time.sleep(0.5)
 
     logger.info(f"Total raw results: {len(all_results)}")
 
-    # Filter and rank
     ranked = filter_and_rank(all_results, min_score=25)
     logger.info(f"After filtering: {len(ranked)} actionable articles")
 
-    # Format and send
     subject = f"🏛️ Pension Allocation Digest — {run_date.strftime('%b %d')} ({len(ranked)} updates)"
     html = format_digest_html(ranked, run_date)
     text = format_digest_text(ranked, run_date)
 
     send_email(subject, html, text)
 
-    # Also save latest digest locally
     latest = Path(__file__).parent / "latest_digest.html"
     latest.write_text(html)
     logger.info(f"Digest saved to {latest}")
